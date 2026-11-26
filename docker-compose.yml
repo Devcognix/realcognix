@@ -1,0 +1,132 @@
+# RealCognix OS — local / single-server stack. Everything here is free and open source.
+# Start:  cp .env.example .env && docker compose up -d
+# Free LLM on first run:  docker compose exec ollama ollama pull qwen2.5:7b && docker compose exec ollama ollama pull nomic-embed-text
+name: realcognix
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-realcognix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-realcognix}
+      POSTGRES_DB: ${POSTGRES_DB:-realcognix}
+      # Password for realcognix_app, the non-owner NOBYPASSRLS role the API and worker use (set by 04-app-role.sh).
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+      - ./infra/postgres/03-n8n.sql:/docker-entrypoint-initdb.d/03-n8n.sql:ro
+      - ./infra/postgres/04-app-role.sh:/docker-entrypoint-initdb.d/04-app-role.sh:ro
+      - ./db/migrations:/rc-migrations:ro
+    ports: ["127.0.0.1:5432:5432"]
+    healthcheck:
+      # -h 127.0.0.1: during first-start init the image runs a temporary server on the unix socket only, so a socket
+      # check reports healthy before 04-app-role.sh has created realcognix_app. TCP is up only once init is done.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-realcognix} -d ${POSTGRES_DB:-realcognix}"]
+      interval: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes: [ollama:/root/.ollama]
+    # GPU: uncomment on an NVIDIA host
+    # deploy: { resources: { reservations: { devices: [{ capabilities: [gpu] }] } } }
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4001"]
+    env_file: .env
+    volumes: ["./infra/litellm/config.yaml:/app/config.yaml:ro"]
+    ports: ["127.0.0.1:4001:4001"]
+    depends_on: [ollama]
+
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports: ["127.0.0.1:8025:8025"]   # dev inbox UI; SMTP on 1025 inside the network
+
+  api:
+    build: { context: ., dockerfile: infra/Dockerfile.api }
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # realcognix_app: not a table owner, NOBYPASSRLS, so Postgres row-level security isolates tenants.
+      DATABASE_URL: postgres://realcognix_app:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-realcognix}
+      POSTGRES_USER: ""         # keep the owner credentials out of the app containers
+      POSTGRES_PASSWORD: ""
+      REDIS_URL: redis://redis:6379
+      LLM_BASE_URL: http://litellm:4001/v1
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      RUN_WORKERS: "false"
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    ports: ["127.0.0.1:4000:4000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: { context: ., dockerfile: infra/Dockerfile.api }
+    restart: unless-stopped
+    command: ["node", "apps/api/dist/worker.js"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://realcognix_app:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-realcognix}
+      POSTGRES_USER: ""
+      POSTGRES_PASSWORD: ""
+      REDIS_URL: redis://redis:6379
+      LLM_BASE_URL: http://litellm:4001/v1
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_DATABASE: n8n   # n8n's own metadata DB. Workflows reach RealCognix data only through the API.
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-realcognix}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-realcognix}
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      WEBHOOK_URL: ${N8N_PUBLIC_URL:-http://localhost:5678/}
+      RC_API_URL: http://api:4000
+      RC_API_TOKEN: ${API_TOKEN}
+      RC_INTAKE_SECRET: ${INTAKE_SHARED_SECRET}
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+    volumes:
+      - n8ndata:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro
+    ports: ["127.0.0.1:5678:5678"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  web:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./docs:/usr/share/nginx/html:ro
+      - ./infra/web/config.js:/usr/share/nginx/html/config.js:ro   # live mode: the UI talks to the API on :4000
+    ports: ["127.0.0.1:8080:80"]
+
+volumes: { pgdata: {}, redisdata: {}, ollama: {}, n8ndata: {} }
