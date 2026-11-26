@@ -164,6 +164,8 @@ BEGIN
     EXECUTE format('GRANT SELECT, INSERT, UPDATE ON %I TO realcognix_app', t);
   END LOOP;
   GRANT SELECT ON organizations TO realcognix_app;
+  -- 007: an org may edit its own name/GSTIN/timezone/settings (policy organizations_self_update limits it to its row).
+  GRANT UPDATE (name, gstin, timezone, settings) ON organizations TO realcognix_app;
   GRANT SELECT ON project_funnel TO realcognix_app;
   EXECUTE 'GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO realcognix_app'; -- none today (uuid keys); future-proof
 
@@ -171,5 +173,13 @@ BEGIN
                            'intake_resolve_source(text,text,lead_source_kind)', 'whatsapp_message_org(text)', 'system_active_clients()'] LOOP
     EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
     EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO realcognix_app', f);
+  END LOOP;
+  -- Lookups added by later migrations (004, 007), when present: re-running 003 must not take them away.
+  FOREACH f IN ARRAY ARRAY['outbox_pending_orgs(integer)', 'outbox_put_raw(text,text,jsonb,text)', 'outbox_raw_pending(integer,integer,timestamptz)',
+                           'outbox_raw_mark(uuid,text)', 'auth_invite_lookup(text)', 'microsite_public_lookup(text,text)', 'org_by_slug(text)'] LOOP
+    IF to_regprocedure(f) IS NOT NULL THEN
+      EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
+      EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO realcognix_app', f);
+    END IF;
   END LOOP;
 END $$;

@@ -947,6 +947,356 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 $$;
 
 -- ---------------------------------------------------------------------
+-- Booking to close (same as db/migrations/006_sales_close.sql; keep the two in sync)
+-- ---------------------------------------------------------------------
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'deal_outcome') THEN
+    CREATE TYPE deal_outcome AS ENUM ('open', 'closed_won', 'closed_lost');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'sale_agreement_status') THEN
+    CREATE TYPE sale_agreement_status AS ENUM ('not_started', 'drafted', 'sent', 'signed', 'registered', 'cancelled');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'payment_status') THEN
+    CREATE TYPE payment_status AS ENUM ('due', 'paid', 'waived', 'cancelled');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'loan_status') THEN
+    CREATE TYPE loan_status AS ENUM ('not_needed', 'applied', 'sanctioned', 'disbursed', 'rejected');
+  END IF;
+END $$;
+
+-- UNIQUE (org_id, id) on a referenced table: the target of composite tenant FKs (same name 005 uses).
+CREATE OR REPLACE FUNCTION pg_temp.rc_org_key(t regclass) RETURNS void LANGUAGE plpgsql AS $f$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint u
+     WHERE u.conrelid = t AND u.contype IN ('u', 'p')
+       AND u.conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = t AND attname = 'org_id'),
+                            (SELECT attnum FROM pg_attribute WHERE attrelid = t AND attname = 'id')]::int2[]) THEN
+    EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I UNIQUE (org_id, id)', t, t::text || '_org_id_id_key');
+  END IF;
+END $f$;
+SELECT pg_temp.rc_org_key('bookings');
+SELECT pg_temp.rc_org_key('users');
+
+ALTER TABLE bookings
+  ADD COLUMN IF NOT EXISTS booking_ref         text,
+  ADD COLUMN IF NOT EXISTS booked_on           date NOT NULL DEFAULT CURRENT_DATE,
+  ADD COLUMN IF NOT EXISTS agreement_status    sale_agreement_status NOT NULL DEFAULT 'not_started',
+  ADD COLUMN IF NOT EXISTS agreement_signed_at timestamptz,
+  ADD COLUMN IF NOT EXISTS registered_at       timestamptz,
+  ADD COLUMN IF NOT EXISTS loan_status         loan_status NOT NULL DEFAULT 'not_needed',
+  ADD COLUMN IF NOT EXISTS loan_amount_inr     numeric(14,2),
+  ADD COLUMN IF NOT EXISTS outcome             deal_outcome NOT NULL DEFAULT 'open',
+  ADD COLUMN IF NOT EXISTS closed_at           timestamptz,
+  ADD COLUMN IF NOT EXISTS cancelled_at        timestamptz,
+  ADD COLUMN IF NOT EXISTS cancellation_reason text,
+  ADD COLUMN IF NOT EXISTS refund_amount_inr   numeric(14,2),
+  ADD COLUMN IF NOT EXISTS lost_reason         text,
+  ADD COLUMN IF NOT EXISTS notes               text,
+  ADD COLUMN IF NOT EXISTS created_by          uuid;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'bookings_created_by_fkey') THEN
+    ALTER TABLE bookings ADD CONSTRAINT bookings_created_by_fkey FOREIGN KEY (org_id, created_by) REFERENCES users (org_id, id) ON DELETE SET NULL (created_by);
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS bookings_outcome_idx ON bookings (org_id, outcome, booked_on DESC);
+
+CREATE TABLE IF NOT EXISTS booking_payments (
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id           uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  booking_id       uuid NOT NULL,
+  position         smallint NOT NULL DEFAULT 0,
+  label            text NOT NULL,                       -- Token, On agreement, Slab 1 ... On possession
+  due_on           date,
+  amount_inr       numeric(14,2) NOT NULL CHECK (amount_inr >= 0),
+  status           payment_status NOT NULL DEFAULT 'due',
+  paid_on          date,
+  paid_amount_inr  numeric(14,2),
+  method           text,                                -- neft, rtgs, cheque, upi, home_loan
+  reference        text,                                -- UTR / cheque number (no bank details)
+  notes            text,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT booking_payments_booking_id_fkey FOREIGN KEY (org_id, booking_id) REFERENCES bookings (org_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS booking_payments_booking_idx ON booking_payments (booking_id, position);
+CREATE INDEX IF NOT EXISTS booking_payments_due_idx ON booking_payments (org_id, status, due_on);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'booking_payments_updated_at') THEN
+    CREATE TRIGGER booking_payments_updated_at BEFORE UPDATE ON booking_payments FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  END IF;
+  ALTER TABLE booking_payments ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE booking_payments FORCE ROW LEVEL SECURITY;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'booking_payments' AND policyname = 'booking_payments_tenant') THEN
+    CREATE POLICY booking_payments_tenant ON booking_payments
+      USING (org_id = NULLIF(current_setting('app.org_id', true), '')::uuid)
+      WITH CHECK (org_id = NULLIF(current_setting('app.org_id', true), '')::uuid);
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'realcognix_app') THEN
+    GRANT SELECT, INSERT, UPDATE ON booking_payments TO realcognix_app;
+  END IF;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- Invites, partner registrations, daily ad metrics, microsite intake, audit log (same as db/migrations/007_platform.sql; keep the two in sync)
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION pg_temp.rc_org_key(t regclass) RETURNS void LANGUAGE plpgsql AS $f$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint u
+     WHERE u.conrelid = t AND u.contype IN ('u', 'p')
+       AND u.conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = t AND attname = 'org_id'),
+                            (SELECT attnum FROM pg_attribute WHERE attrelid = t AND attname = 'id')]::int2[]) THEN
+    EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I UNIQUE (org_id, id)', t, t::text || '_org_id_id_key');
+  END IF;
+END $f$;
+SELECT pg_temp.rc_org_key(t) FROM unnest(ARRAY['users', 'roles', 'channel_partners', 'leads', 'projects', 'campaigns', 'lead_sources']::regclass[]) t;
+
+-- ---------------------------------------------------------------- invites
+CREATE TABLE IF NOT EXISTS user_invites (
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id       uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id      uuid NOT NULL,
+  email        citext NOT NULL,
+  role_id      uuid NOT NULL,
+  token_hash   text NOT NULL UNIQUE,                     -- sha256 of the invite token; the token itself is never stored
+  invited_by   uuid,
+  expires_at   timestamptz NOT NULL,
+  accepted_at  timestamptz,
+  revoked_at   timestamptz,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT user_invites_user_id_fkey FOREIGN KEY (org_id, user_id) REFERENCES users (org_id, id) ON DELETE CASCADE,
+  CONSTRAINT user_invites_role_id_fkey FOREIGN KEY (org_id, role_id) REFERENCES roles (org_id, id),
+  CONSTRAINT user_invites_invited_by_fkey FOREIGN KEY (org_id, invited_by) REFERENCES users (org_id, id) ON DELETE SET NULL (invited_by)
+);
+CREATE INDEX IF NOT EXISTS user_invites_user_idx ON user_invites (user_id) WHERE accepted_at IS NULL AND revoked_at IS NULL;
+
+-- ---------------------------------------------------------------- channel partner registrations
+CREATE TABLE IF NOT EXISTS partner_lead_registrations (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id         uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  partner_id     uuid NOT NULL,
+  lead_id        uuid,
+  project_id     uuid,
+  phone_e164     text,
+  status         text NOT NULL CHECK (status IN ('accepted', 'rejected')),
+  reason         text,                                   -- buyer_exists, owned_by_other_partner, ...
+  registered_at  timestamptz NOT NULL DEFAULT now(),
+  expires_at     timestamptz,                            -- accepted: registered_at + ownership window
+  registered_by  uuid,
+  CONSTRAINT partner_lead_registrations_partner_id_fkey FOREIGN KEY (org_id, partner_id) REFERENCES channel_partners (org_id, id) ON DELETE CASCADE,
+  CONSTRAINT partner_lead_registrations_lead_id_fkey FOREIGN KEY (org_id, lead_id) REFERENCES leads (org_id, id) ON DELETE CASCADE,
+  CONSTRAINT partner_lead_registrations_project_id_fkey FOREIGN KEY (org_id, project_id) REFERENCES projects (org_id, id) ON DELETE SET NULL (project_id),
+  CONSTRAINT partner_lead_registrations_registered_by_fkey FOREIGN KEY (org_id, registered_by) REFERENCES users (org_id, id) ON DELETE SET NULL (registered_by)
+);
+CREATE INDEX IF NOT EXISTS partner_lead_registrations_partner_idx ON partner_lead_registrations (partner_id, registered_at DESC);
+CREATE INDEX IF NOT EXISTS partner_lead_registrations_lead_idx ON partner_lead_registrations (lead_id) WHERE status = 'accepted';
+
+-- ---------------------------------------------------------------- daily ad metrics
+CREATE TABLE IF NOT EXISTS campaign_daily_metrics (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id        uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  campaign_id   uuid NOT NULL,
+  day           date NOT NULL,
+  spend_inr     numeric(14,2) NOT NULL DEFAULT 0,
+  impressions   bigint NOT NULL DEFAULT 0,
+  clicks        bigint NOT NULL DEFAULT 0,
+  leads_reported integer,                                -- platform-reported leads (ours come from the leads table)
+  synced_at     timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT campaign_daily_metrics_campaign_id_fkey FOREIGN KEY (org_id, campaign_id) REFERENCES campaigns (org_id, id) ON DELETE CASCADE,
+  CONSTRAINT campaign_daily_metrics_day UNIQUE (campaign_id, day)
+);
+CREATE INDEX IF NOT EXISTS campaign_daily_metrics_org_day_idx ON campaign_daily_metrics (org_id, day);
+
+-- ---------------------------------------------------------------- microsites
+ALTER TABLE microsites
+  ADD COLUMN IF NOT EXISTS lead_source_id uuid,
+  ADD COLUMN IF NOT EXISTS consent_text   text,
+  ADD COLUMN IF NOT EXISTS notice_version text NOT NULL DEFAULT 'v1',
+  ADD COLUMN IF NOT EXISTS archived_at    timestamptz;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'microsites_lead_source_id_fkey') THEN
+    ALTER TABLE microsites ADD CONSTRAINT microsites_lead_source_id_fkey FOREIGN KEY (org_id, lead_source_id) REFERENCES lead_sources (org_id, id) ON DELETE SET NULL (lead_source_id);
+  END IF;
+END $$;
+
+-- ---------------------------------------------------------------- audit log
+CREATE TABLE IF NOT EXISTS audit_log (
+  id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  org_id         uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  actor_type     text NOT NULL DEFAULT 'user' CHECK (actor_type IN ('user', 'service', 'system')),
+  actor_user_id  uuid,
+  entity_type    text NOT NULL,                          -- provider_config, ai_route, org_settings, user, role, partner_payout ...
+  entity_id      text,
+  action         text NOT NULL,                          -- create, update, enable, disable, archive, test, select ...
+  changes        jsonb NOT NULL DEFAULT '{}'::jsonb,     -- secrets are never written here, only "changed"
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT audit_log_actor_user_id_fkey FOREIGN KEY (org_id, actor_user_id) REFERENCES users (org_id, id) ON DELETE SET NULL (actor_user_id)
+);
+CREATE INDEX IF NOT EXISTS audit_log_org_idx ON audit_log (org_id, created_at DESC);
+
+-- ---------------------------------------------------------------- RLS, triggers, grants for the new tables
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['user_invites', 'partner_lead_registrations', 'campaign_daily_metrics', 'audit_log'] LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = t AND policyname = t || '_tenant') THEN
+      EXECUTE format(
+        'CREATE POLICY %I_tenant ON %I USING (org_id = NULLIF(current_setting(''app.org_id'', true), '''')::uuid) '
+        'WITH CHECK (org_id = NULLIF(current_setting(''app.org_id'', true), '''')::uuid)', t, t);
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'realcognix_app') THEN
+      EXECUTE format('GRANT SELECT, INSERT, UPDATE ON %I TO realcognix_app', t);
+    END IF;
+  END LOOP;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'campaign_daily_metrics_updated_at') THEN
+    CREATE TRIGGER campaign_daily_metrics_updated_at BEFORE UPDATE ON campaign_daily_metrics FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'realcognix_app') THEN
+    GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO realcognix_app;     -- audit_log identity
+    GRANT UPDATE (name, gstin, timezone, settings) ON organizations TO realcognix_app;
+  END IF;
+  -- Each org may update only its own row (SELECT policy organizations_self already exists).
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'organizations' AND policyname = 'organizations_self_update') THEN
+    CREATE POLICY organizations_self_update ON organizations FOR UPDATE
+      USING (id = NULLIF(current_setting('app.org_id', true), '')::uuid)
+      WITH CHECK (id = NULLIF(current_setting('app.org_id', true), '')::uuid);
+  END IF;
+END $$;
+
+-- ---------------------------------------------------------------- SECURITY DEFINER lookups
+-- Accept an invite: runs before the org is known. Returns the minimum to finish the sign-up scoped to that org.
+CREATE OR REPLACE FUNCTION auth_invite_lookup(p_token_hash text)
+RETURNS TABLE (invite_id uuid, org_id uuid, user_id uuid, email text, full_name text, org_name text,
+               expires_at timestamptz, accepted_at timestamptz, revoked_at timestamptz)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT i.id, i.org_id, i.user_id, i.email::text, u.full_name, o.name, i.expires_at, i.accepted_at, i.revoked_at
+    FROM user_invites i JOIN users u ON u.id = i.user_id JOIN organizations o ON o.id = i.org_id
+   WHERE i.token_hash = p_token_hash
+$$;
+
+-- Public microsite: a published, non-archived microsite by slug or custom domain. Ids only.
+CREATE OR REPLACE FUNCTION microsite_public_lookup(p_slug text, p_domain text DEFAULT NULL)
+RETURNS TABLE (org_id uuid, microsite_id uuid)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT m.org_id, m.id FROM microsites m
+   WHERE m.status = 'published' AND m.archived_at IS NULL
+     AND ((p_slug IS NOT NULL AND m.slug = p_slug) OR (p_domain IS NOT NULL AND m.custom_domain = lower(p_domain)))
+   ORDER BY m.published_at DESC NULLS LAST LIMIT 1
+$$;
+
+-- Per-org webhook URLs carry the org slug: resolve it to the id (the secret is then checked scoped to that org).
+CREATE OR REPLACE FUNCTION org_by_slug(p_slug text)
+RETURNS uuid
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT o.id FROM organizations o WHERE o.slug = p_slug
+$$;
+
+DO $$
+DECLARE f text;
+  fns text[] := ARRAY['auth_invite_lookup(text)', 'microsite_public_lookup(text,text)', 'org_by_slug(text)'];
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'realcognix_system') THEN
+    GRANT USAGE ON SCHEMA public TO realcognix_system;
+    GRANT SELECT ON user_invites, users, organizations, microsites TO realcognix_system;
+    GRANT CREATE ON SCHEMA public TO realcognix_system;
+    FOREACH f IN ARRAY fns LOOP
+      EXECUTE format('ALTER FUNCTION %s OWNER TO realcognix_system', f);
+    END LOOP;
+    REVOKE CREATE ON SCHEMA public FROM realcognix_system;
+  END IF;
+  FOREACH f IN ARRAY fns LOOP
+    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'realcognix_app') THEN
+      EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO realcognix_app', f);
+    END IF;
+  END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- Provider registry (admin-switchable vendors) (same as db/migrations/008_provider_registry.sql; keep the two in sync)
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION pg_temp.rc_org_key(t regclass) RETURNS void LANGUAGE plpgsql AS $f$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint u
+     WHERE u.conrelid = t AND u.contype IN ('u', 'p')
+       AND u.conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = t AND attname = 'org_id'),
+                            (SELECT attnum FROM pg_attribute WHERE attrelid = t AND attname = 'id')]::int2[]) THEN
+    EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I UNIQUE (org_id, id)', t, t::text || '_org_id_id_key');
+  END IF;
+END $f$;
+SELECT pg_temp.rc_org_key('users');
+
+CREATE TABLE IF NOT EXISTS provider_configs (
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id           uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  capability       text NOT NULL CHECK (capability IN ('llm', 'embeddings', 'messaging', 'email', 'storage', 'ads', 'lead_sources', 'automations')),
+  provider         text NOT NULL,                       -- groq, gemini, openrouter, ollama, whatsapp_cloud, smtp, s3, n8n ...
+  label            text NOT NULL,
+  enabled          boolean NOT NULL DEFAULT true,
+  is_primary       boolean NOT NULL DEFAULT false,
+  config           jsonb NOT NULL DEFAULT '{}'::jsonb,
+  secrets_enc      text,
+  secret_hints     jsonb NOT NULL DEFAULT '{}'::jsonb,
+  last_test_at     timestamptz,
+  last_test_ok     boolean,
+  last_test_error  text,
+  archived_at      timestamptz,
+  created_by       uuid,
+  updated_by       uuid,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT provider_configs_created_by_fkey FOREIGN KEY (org_id, created_by) REFERENCES users (org_id, id) ON DELETE SET NULL (created_by),
+  CONSTRAINT provider_configs_updated_by_fkey FOREIGN KEY (org_id, updated_by) REFERENCES users (org_id, id) ON DELETE SET NULL (updated_by)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS provider_configs_primary_idx ON provider_configs (org_id, capability) WHERE is_primary AND archived_at IS NULL;
+CREATE INDEX IF NOT EXISTS provider_configs_org_idx ON provider_configs (org_id, capability) WHERE archived_at IS NULL;
+SELECT pg_temp.rc_org_key('provider_configs');
+
+CREATE TABLE IF NOT EXISTS ai_agent_routes (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id      uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  agent       text NOT NULL CHECK (agent IN ('default', 'lead_qualifier', 'follow_up', 'reporting', 'creative', 'scoring')),
+  chain       jsonb NOT NULL DEFAULT '[]'::jsonb,        -- [{"connectionId": uuid, "model": "llama-3.3-70b-versatile"}, ...]
+  temperature numeric(3,2),
+  updated_by  uuid,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT ai_agent_routes_agent UNIQUE (org_id, agent),
+  CONSTRAINT ai_agent_routes_updated_by_fkey FOREIGN KEY (org_id, updated_by) REFERENCES users (org_id, id) ON DELETE SET NULL (updated_by)
+);
+
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['provider_configs', 'ai_agent_routes'] LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = t || '_updated_at') THEN
+      EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION set_updated_at()', t || '_updated_at', t);
+    END IF;
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = t AND policyname = t || '_tenant') THEN
+      EXECUTE format(
+        'CREATE POLICY %I_tenant ON %I USING (org_id = NULLIF(current_setting(''app.org_id'', true), '''')::uuid) '
+        'WITH CHECK (org_id = NULLIF(current_setting(''app.org_id'', true), '''')::uuid)', t, t);
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'realcognix_app') THEN
+      EXECUTE format('GRANT SELECT, INSERT, UPDATE ON %I TO realcognix_app', t);
+    END IF;
+  END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------
 -- Tenant-safe foreign keys (same as db/migrations/005_tenant_fks.sql; keep the two DO blocks identical).
 -- FK checks ignore RLS, so every reference between org-scoped tables is rewritten to (org_id, <col>) ->
 -- parent (org_id, id), with UNIQUE (org_id, id) on each referenced table: a row can only point at a row of its own org.
