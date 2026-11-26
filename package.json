@@ -14,12 +14,12 @@
   },
   "scripts": {
     "build": "tsc -b packages/core packages/adapters packages/agents apps/api",
-    "typecheck": "tsc -b packages/core packages/adapters packages/agents apps/api && npm run typecheck -w apps/web",
+    "typecheck": "tsc -b packages/core packages/adapters packages/agents apps/api",
     "dev:api": "npm run dev -w apps/api",
-    "dev:web": "npm run dev -w apps/web",
+    "dev:web": "npx --yes serve docs -l 8080",
     "test": "npm run build && node --test apps/api/dist/**/*.test.js packages/core/dist/**/*.test.js",
     "set-password": "npm run set-password -w apps/api --",
-    "clean": "rm -rf packages/*/dist apps/api/dist apps/web/.next **/*.tsbuildinfo"
+    "clean": "rm -rf packages/*/dist apps/api/dist **/*.tsbuildinfo"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

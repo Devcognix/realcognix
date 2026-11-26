@@ -138,7 +138,7 @@ New tables get no default grants. A migration that adds one must add `org_id`, e
 
 ### Known limits
 
-- Foreign keys are on `id` alone, not composite `(org_id, id)`. Postgres would accept a row in one org that points at another org's row, so cross-tenant references are only blocked in code.
+- Cross-org references are refused by the database through composite `(org_id, id)` foreign keys (migration `005_tenant_fks.sql`). Apply it to databases created before it.
 - Inbound WhatsApp messages that match no known number, and webhooks whose org is unclear, go to `DEFAULT_ORG_ID`.
 - n8n uses the Postgres superuser for its own metadata database. It reaches RealCognix data only through the API.
 - LiteLLM loads the whole `.env` (`env_file`), so it can see every secret in it, database passwords included.
