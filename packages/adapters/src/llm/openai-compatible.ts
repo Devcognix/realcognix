@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import OpenAI, { AzureOpenAI } from 'openai';
 import type { z } from 'zod';
 import { AdapterError } from '../errors.js';
 import type { ChatMessage, ChatOptions, ChatResult, LLMProvider } from './types.js';
@@ -9,14 +9,43 @@ export interface OpenAICompatibleConfig {
   model: string; // alias configured in LiteLLM (default | groq | gemini) or a raw model id
   embedModel: string;
   timeoutMs?: number;
+  /** Send response_format=json_object (default true). Off for endpoints that reject it (e.g. Anthropic's). */
+  jsonMode?: boolean;
+  /** Ask the embeddings endpoint for this many dimensions (OpenAI text-embedding-3-*). pgvector column is 768. */
+  embedDimensions?: number;
+  /** Azure OpenAI: baseURL is the resource endpoint, model is the deployment name. */
+  azure?: { apiVersion: string };
+  /** Label for errors and run logs, e.g. 'groq'. */
+  label?: string;
+  headers?: Record<string, string>;
+  maxRetries?: number;
 }
 
 export class OpenAICompatibleLLM implements LLMProvider {
-  readonly name = 'openai_compatible';
+  readonly name: string;
   private readonly client: OpenAI;
 
   constructor(private readonly cfg: OpenAICompatibleConfig) {
-    this.client = new OpenAI({ baseURL: cfg.baseURL, apiKey: cfg.apiKey, timeout: cfg.timeoutMs ?? 60_000, maxRetries: 2 });
+    this.name = cfg.label ?? 'openai_compatible';
+    const common = { apiKey: cfg.apiKey || 'none', timeout: cfg.timeoutMs ?? 60_000, maxRetries: cfg.maxRetries ?? 2, defaultHeaders: cfg.headers };
+    this.client = cfg.azure
+      ? new AzureOpenAI({ ...common, endpoint: cfg.baseURL, apiVersion: cfg.azure.apiVersion, deployment: cfg.model })
+      : new OpenAI({ ...common, baseURL: cfg.baseURL });
+  }
+
+  get model() {
+    return this.cfg.model;
+  }
+
+  /** One tiny real completion: proves the URL, key and model all work. */
+  async health(): Promise<{ ok: boolean; model?: string; latencyMs: number; error?: string }> {
+    const t = Date.now();
+    try {
+      const r = await this.complete([{ role: 'user', content: 'Reply with the single word OK.' }], { temperature: 0, maxTokens: 5 }, false);
+      return { ok: true, model: r.model, latencyMs: Date.now() - t };
+    } catch (e) {
+      return { ok: false, latencyMs: Date.now() - t, error: (e as Error).message };
+    }
   }
 
   async chat(messages: ChatMessage[], opts: ChatOptions = {}): Promise<ChatResult> {
@@ -44,8 +73,15 @@ export class OpenAICompatibleLLM implements LLMProvider {
   }
 
   async embed(texts: string[], opts: { model?: string } = {}): Promise<number[][]> {
-    const res = await this.client.embeddings.create({ model: opts.model ?? this.cfg.embedModel, input: texts });
-    return res.data.map((d) => d.embedding);
+    try {
+      const res = await this.client.embeddings.create({
+        model: opts.model ?? this.cfg.embedModel, input: texts, encoding_format: 'float', // many compatible servers ignore base64
+        ...(this.cfg.embedDimensions ? { dimensions: this.cfg.embedDimensions } : {}),
+      });
+      return res.data.map((d) => d.embedding);
+    } catch (err) {
+      throw new AdapterError(this.name, `embeddings failed for model "${opts.model ?? this.cfg.embedModel}": ${(err as Error).message}`, (err as { status?: number }).status);
+    }
   }
 
   private async complete(messages: ChatMessage[], opts: ChatOptions, asJson: boolean): Promise<ChatResult> {
@@ -56,7 +92,7 @@ export class OpenAICompatibleLLM implements LLMProvider {
         messages,
         temperature: opts.temperature ?? 0.3,
         ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
-        ...(asJson ? { response_format: { type: 'json_object' as const } } : {}),
+        ...(asJson && this.cfg.jsonMode !== false ? { response_format: { type: 'json_object' as const } } : {}),
       });
       return {
         text: res.choices[0]?.message?.content ?? '',

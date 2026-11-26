@@ -1,6 +1,6 @@
 import { runFollowUpDrafter } from '@realcognix/agents';
 import { isQuietHours, nextAllowedTime, renderTemplate, scheduleAtDayOffset, type QuietHours } from '@realcognix/core';
-import type { AppContext } from '../context.js';
+import { agentDeps, type AppContext } from '../context.js';
 import { addLeadEvent } from '../lib/db.js';
 import { dispatchStaged, enqueueJob, jobSpec, stageJob } from '../queues/outbox.js';
 import { sendOutbound } from './messaging.js';
@@ -118,7 +118,7 @@ export async function runCadenceStep(ctx: AppContext, orgId: string, enrollmentI
       const recent = await ctx.db.query<{ direction: string; body: string }>(
         `SELECT direction, body FROM messages WHERE lead_id = $1 AND body IS NOT NULL ORDER BY created_at DESC LIMIT 6`, [leadId],
       );
-      const draft = await runFollowUpDrafter(ctx.agents, {
+      const draft = await runFollowUpDrafter(await agentDeps(ctx, orgId, 'follow_up'), {
         orgId, leadId, stepId: step.id, channel: step.channel, dayOffset: step.day_offset, baseMessage: step.body ?? '',
         useAi: step.use_ai_draft, requiresApproval: step.requires_approval,
         lead: { name: row.full_name, stage: row.stage, bhk: row.bhk_preference, budgetMaxInr: row.budget_max_inr, timeline: row.timeline, language: row.preferred_language },

@@ -40,7 +40,7 @@ export async function scoreAndSave(ctx: AppContext, q: Q, leadId: string, extra:
 
   if (ctx.config.LLM_SCORING_ENABLED && extra.freeText) {
     try {
-      const { data } = await ctx.adapters.llm.json(
+      const { data } = await (await ctx.providers.forOrg(l.org_id)).llmFor('scoring').json(
         [
           { role: 'system', content: 'You adjust a real-estate lead score. Reply JSON {"adjustment": -15..15, "reason": string}. Positive for urgency/intent, negative for disinterest. 0 if unclear.' },
           { role: 'user', content: `Rule score ${result.score}. Buyer said: """${extra.freeText.slice(0, 1500)}"""` },

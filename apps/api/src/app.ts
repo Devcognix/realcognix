@@ -12,6 +12,7 @@ import { complianceRoutes } from './routes/compliance.js';
 import { agentRoutes } from './routes/agents.js';
 import { authRoutes } from './routes/auth.js';
 import { readRoutes } from './routes/read.js';
+import { adminIntegrationRoutes } from './routes/admin-integrations.js';
 
 export async function buildApp(ctx: AppContext, app: FastifyInstance = Fastify({ logger: true, trustProxy: parseTrustProxy(ctx.config.TRUST_PROXY) } as FastifyServerOptions)) {
   await app.register(sensible);
@@ -41,5 +42,6 @@ export async function buildApp(ctx: AppContext, app: FastifyInstance = Fastify({
   await app.register(async (i) => complianceRoutes(i, ctx), { prefix: '/v1' });
   await app.register(async (i) => agentRoutes(i, ctx), { prefix: '/v1' });
   await app.register(async (i) => readRoutes(i, ctx), { prefix: '/v1' });
+  await app.register(async (i) => adminIntegrationRoutes(i, ctx), { prefix: '/v1' });
   return app;
 }

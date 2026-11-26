@@ -30,4 +30,6 @@ export interface LLMProvider {
   /** Ask for JSON and validate it against a zod schema (one repair retry). */
   json<S extends z.ZodType>(messages: ChatMessage[], schema: S, opts?: ChatOptions): Promise<{ data: z.infer<S>; result: ChatResult }>;
   embed(texts: string[], opts?: { model?: string }): Promise<number[][]>;
+  /** Optional live check (a tiny real call). */
+  health?(): Promise<{ ok: boolean; model?: string; latencyMs: number; error?: string }>;
 }

@@ -1,7 +1,7 @@
 import { runLeadQualifier } from '@realcognix/agents';
 import type { InboundEvent } from '@realcognix/adapters';
 import { OPT_OUT_PATTERN } from '@realcognix/core';
-import type { AppContext } from '../context.js';
+import { agentDeps, type AppContext } from '../context.js';
 import { addLeadEvent } from '../lib/db.js';
 import type { LeadRow } from '../lib/types.js';
 import { ensureConversation, sendOutbound } from './messaging.js';
@@ -85,7 +85,7 @@ async function handleInboundMessage(ctx: AppContext, orgId: string, ev: Extract<
   const transcript = history.rows.reverse().map((m) => ({ from: m.direction === 'inbound' ? 'lead' as const : 'agent' as const, text: m.body }));
   const questionsAsked = history.rows.filter((m) => m.sender_type === 'agent').length;
 
-  const out = await runLeadQualifier(ctx.agents, {
+  const out = await runLeadQualifier(await agentDeps(ctx, orgId, 'lead_qualifier'), {
     orgId, leadId: lead.id,
     lead: { name: lead.full_name, language: lead.preferred_language, hasValidPhone: !!lead.phone_e164, hasEmail: !!lead.email },
     project: {
@@ -124,7 +124,7 @@ async function handleInboundMessage(ctx: AppContext, orgId: string, ev: Extract<
     await sendOutbound(ctx, { orgId, leadId: lead.id, channel: 'whatsapp', purpose: 'transactional', body: out.reply, senderType: 'agent' });
   } else if (out.reply && out.outcome === 'opted_out') {
     // Confirmation of opt-out is the one message allowed after STOP; send directly and log.
-    await ctx.adapters.whatsapp.sendText({ to: lead.phone_e164!, body: out.reply }).catch(() => undefined);
+    await (await ctx.providers.forOrg(orgId)).whatsapp.sendText({ to: lead.phone_e164!, body: out.reply }).catch(() => undefined);
   }
 }
 

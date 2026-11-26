@@ -16,6 +16,9 @@ import { MetaMarketingAds } from './ads/meta-marketing.js';
 import { GoogleAdsPlatform } from './ads/google-ads.js';
 import type { StorageProvider } from './storage/types.js';
 import { LocalStorage } from './storage/local.js';
+import { S3Storage } from './storage/s3.js';
+import { providerSpec } from './registry/catalog.js';
+import { buildLlm } from './registry/build.js';
 
 export interface Adapters {
   llm: LLMProvider;
@@ -35,10 +38,31 @@ export interface Adapters {
  * and select it with the matching env var (e.g. WHATSAPP_PROVIDER=gupshup). No business logic changes.
  */
 const llmProviders: Record<AppConfig['LLM_PROVIDER'], (c: AppConfig) => LLMProvider> = {
-  openai_compatible: (c) =>
-    new OpenAICompatibleLLM({ baseURL: c.LLM_BASE_URL, apiKey: c.LLM_API_KEY, model: c.LLM_MODEL, embedModel: c.LLM_EMBED_MODEL }),
+  openai_compatible: (c) => envLlm(c),
   none: () => new DisabledLLM(),
 };
+
+const ENV_KEYS: Record<string, keyof AppConfig> = {
+  groq: 'GROQ_API_KEY', gemini: 'GEMINI_API_KEY', openrouter: 'OPENROUTER_API_KEY', mistral: 'MISTRAL_API_KEY', together: 'TOGETHER_API_KEY',
+  cerebras: 'CEREBRAS_API_KEY', openai: 'OPENAI_API_KEY', anthropic: 'ANTHROPIC_API_KEY',
+};
+
+/**
+ * The env-configured LLM, used when an org has nothing set in Integrations & AI.
+ * LLM_BACKEND=litellm (default): the LiteLLM proxy at LLM_BASE_URL with alias LLM_MODEL.
+ * Otherwise: that provider's OpenAI-compatible endpoint, its *_API_KEY, its default model unless LLM_MODEL names one.
+ */
+export function envLlm(c: AppConfig): LLMProvider {
+  if (c.LLM_BACKEND === 'litellm') {
+    return new OpenAICompatibleLLM({ label: `litellm:${c.LLM_MODEL}`, baseURL: c.LLM_BASE_URL, apiKey: c.LLM_API_KEY, model: c.LLM_MODEL, embedModel: c.LLM_EMBED_MODEL });
+  }
+  const spec = providerSpec('llm', c.LLM_BACKEND);
+  const keyName = ENV_KEYS[c.LLM_BACKEND];
+  const apiKey = (keyName ? (c[keyName] as string | undefined) : undefined) ?? c.LLM_API_KEY;
+  const baseUrl = c.LLM_DIRECT_BASE_URL ?? (c.LLM_BACKEND === 'ollama' ? c.OLLAMA_BASE_URL : spec?.llm?.baseUrl ?? '');
+  const model = c.LLM_MODEL && c.LLM_MODEL !== 'default' ? c.LLM_MODEL : spec?.llm?.defaultModel;
+  return buildLlm({ id: 'env', capability: 'llm', provider: c.LLM_BACKEND, config: { baseUrl, model, embedModel: c.LLM_EMBED_MODEL !== 'embed' ? c.LLM_EMBED_MODEL : undefined }, secrets: { apiKey } });
+}
 
 const whatsappProviders: Record<AppConfig['WHATSAPP_PROVIDER'], (c: AppConfig) => MessageChannel> = {
   whatsapp_cloud: (c) =>
@@ -61,6 +85,10 @@ const emailProviders: Record<AppConfig['EMAIL_PROVIDER'], (c: AppConfig) => Emai
 
 const storageProviders: Record<AppConfig['STORAGE_PROVIDER'], (c: AppConfig) => StorageProvider> = {
   local: (c) => new LocalStorage(c.STORAGE_LOCAL_DIR, c.PUBLIC_API_URL),
+  s3: (c) => new S3Storage({
+    endpoint: c.S3_ENDPOINT ?? '', region: c.S3_REGION, bucket: c.S3_BUCKET ?? '', accessKeyId: c.S3_ACCESS_KEY_ID ?? '',
+    secretAccessKey: c.S3_SECRET_ACCESS_KEY ?? '', forcePathStyle: c.S3_FORCE_PATH_STYLE, publicBaseUrl: c.S3_PUBLIC_BASE_URL,
+  }),
 };
 
 export function createAdapters(config: AppConfig): Adapters {

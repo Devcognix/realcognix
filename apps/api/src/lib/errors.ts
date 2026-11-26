@@ -19,6 +19,8 @@ export function httpErrorHandler(err: FastifyError | Error, req: FastifyRequest,
     return reply.code(422).send({ error: 'invalid_reference', message: 'a referenced record does not exist in this organization' });
   }
   const status = (err as { statusCode?: number }).statusCode ?? 500;
-  if (status >= 500) req.log.error(err);
-  return reply.code(status).send({ error: status >= 500 ? 'internal_error' : (err as Error).message });
+  if (status >= 500 && status !== 503) req.log.error(err);
+  const fields = (err as { fields?: Record<string, string> }).fields;
+  if (code === '23505' && status === 500) return reply.code(409).send({ error: 'already_exists' });
+  return reply.code(status).send({ error: status >= 500 && status !== 503 ? 'internal_error' : (err as Error).message, ...(fields ? { fields } : {}) });
 }

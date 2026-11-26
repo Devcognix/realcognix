@@ -46,6 +46,36 @@ export const ConfigSchema = z.object({
   OUTBOX_DRAIN_MS: z.coerce.number().int().min(1000).default(15_000),
   OUTBOX_MAX_ATTEMPTS: z.coerce.number().int().min(1).default(10),
 
+  // Public URL of the web app (invite links, microsite links). Set at deploy, e.g. https://app.realcognix.example
+  PUBLIC_WEB_URL: z.string().default('http://localhost:8080'),
+  INVITE_TTL_HOURS: z.coerce.number().int().min(1).default(72),
+  PARTNER_OWNERSHIP_DAYS: z.coerce.number().int().min(1).default(90),
+
+  // Provider registry: per-org vendor settings live in provider_configs; their secrets are AES-256-GCM encrypted with
+  // this key (32 bytes, hex or base64). Required in production to save secrets. Old key for rotation: *_PREVIOUS.
+  CONFIG_MASTER_KEY: optStr,
+  CONFIG_MASTER_KEY_PREVIOUS: optStr,
+  PROVIDER_CACHE_SECONDS: z.coerce.number().int().min(0).default(30),
+
+  // LLM env fallback (used when an org has nothing configured in Integrations & AI).
+  // LLM_BACKEND=litellm talks to LLM_BASE_URL (the LiteLLM proxy) with alias LLM_MODEL; any other value calls that
+  // provider's OpenAI-compatible endpoint directly with its *_API_KEY and default model (LLM_MODEL overrides it).
+  LLM_BACKEND: z.enum(['litellm', 'groq', 'gemini', 'openrouter', 'ollama', 'mistral', 'together', 'cerebras', 'openai', 'anthropic', 'custom']).default('litellm'),
+  LLM_DIRECT_BASE_URL: optStr, // for LLM_BACKEND=custom (or to override a provider's default endpoint)
+  OLLAMA_BASE_URL: z.string().default('http://ollama:11434/v1'),
+  GROQ_API_KEY: optStr,
+  GEMINI_API_KEY: optStr,
+  OPENROUTER_API_KEY: optStr,
+  MISTRAL_API_KEY: optStr,
+  TOGETHER_API_KEY: optStr,
+  CEREBRAS_API_KEY: optStr,
+  OPENAI_API_KEY: optStr,
+  ANTHROPIC_API_KEY: optStr,
+
+  // Automations (n8n REST API) for listing / toggling workflows from the Automations screen.
+  N8N_API_URL: optStr, // e.g. http://n8n:5678
+  N8N_API_KEY: optStr,
+
   // LLM — OpenAI-compatible endpoint (LiteLLM proxy by default; can point straight at Ollama/Groq/Gemini-compat)
   LLM_PROVIDER: z.enum(['openai_compatible', 'none']).default('openai_compatible'),
   LLM_BASE_URL: z.string().default('http://localhost:4001/v1'),
@@ -89,8 +119,16 @@ export const ConfigSchema = z.object({
   GOOGLE_ADS_OAUTH_ACCESS_TOKEN: z.string().optional(),
 
   // Storage
-  STORAGE_PROVIDER: z.enum(['local']).default('local'),
+  STORAGE_PROVIDER: z.enum(['local', 's3']).default('local'),
   STORAGE_LOCAL_DIR: z.string().default('./storage'),
+  // S3-compatible (Cloudflare R2, MinIO, Supabase Storage, AWS S3)
+  S3_ENDPOINT: optStr, // https://<account>.r2.cloudflarestorage.com | http://minio:9000 | https://<ref>.supabase.co/storage/v1/s3
+  S3_REGION: z.string().default('auto'),
+  S3_BUCKET: optStr,
+  S3_ACCESS_KEY_ID: optStr,
+  S3_SECRET_ACCESS_KEY: optStr,
+  S3_FORCE_PATH_STYLE: z.enum(['true', 'false', '1', '0']).default('true').transform((v) => v === 'true' || v === '1'),
+  S3_PUBLIC_BASE_URL: optStr,
 
   // Sales engine rules
   SLA_MINUTES: z.coerce.number().default(5),

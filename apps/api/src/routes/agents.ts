@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { runCreativeAgent, runReportingAgent } from '@realcognix/agents';
-import type { AppContext } from '../context.js';
+import { agentDeps, type AppContext } from '../context.js';
 import { requireRole, useApiAuth } from '../lib/auth.js';
 import { fetchClientMetrics } from '../services/reports.js';
 import { sendOutbound } from '../services/messaging.js';
@@ -25,7 +25,7 @@ export async function agentRoutes(app: FastifyInstance, ctx: AppContext) {
     );
     if (!p) return reply.notFound();
     if (!p.rera_number) return reply.code(422).send({ error: 'compliance_blocked', reasons: ['project has no RERA number'] });
-    const out = await runCreativeAgent(ctx.agents, {
+    const out = await runCreativeAgent(await agentDeps(ctx, req.auth.orgId, 'creative'), {
       orgId: req.auth.orgId, projectId: b.projectId, persona: b.persona, language: b.language, format: b.format, count: b.count,
       project: { name: p.name, propertyType: p.property_type, locality: p.locality, city: p.city, priceFromInr: p.price_min_inr,
         configurations: p.configs ?? [], possession: p.possession_date, usps: p.amenities, reraNumber: p.rera_number },
@@ -100,7 +100,7 @@ export async function runWeeklyReport(ctx: AppContext, orgId: string, clientId: 
        FROM clients c WHERE c.id = $1 AND c.org_id = $2`, [clientId, orgId],
   );
   if (!c) return null;
-  const out = await runReportingAgent(ctx.agents, {
+  const out = await runReportingAgent(await agentDeps(ctx, orgId, 'reporting'), {
     orgId, clientId, clientName: c.brand_name ?? c.legal_name, projects: c.projects ?? [], periodStart, periodEnd,
     targets: { leads: c.target_leads, siteVisits: c.target_site_visits, bookings: c.target_bookings, budgetInr: c.monthly_budget_inr },
     fetchMetrics: (s, e) => fetchClientMetrics(ctx, clientId, s, e),

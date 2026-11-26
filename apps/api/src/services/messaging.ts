@@ -73,12 +73,13 @@ export async function sendOutbound(ctx: AppContext, r: OutboundRequest): Promise
 
   try {
     let providerMessageId: string;
+    const providers = await ctx.providers.forOrg(r.orgId);
     if (r.channel === 'whatsapp') {
       providerMessageId = useTemplate
-        ? (await ctx.adapters.whatsapp.sendTemplate({ to: to!, templateName: r.templateName!, bodyParams: r.templateParams, language: r.templateLanguage })).providerMessageId
-        : (await ctx.adapters.whatsapp.sendText({ to: to!, body: r.body })).providerMessageId;
+        ? (await providers.whatsapp.sendTemplate({ to: to!, templateName: r.templateName!, bodyParams: r.templateParams, language: r.templateLanguage })).providerMessageId
+        : (await providers.whatsapp.sendText({ to: to!, body: r.body })).providerMessageId;
     } else {
-      providerMessageId = (await ctx.adapters.email.send({
+      providerMessageId = (await providers.email.send({
         to: to!, subject: r.subject ?? 'Update from our team', text: r.body,
         headers: r.purpose === 'marketing' ? { 'List-Unsubscribe': `<${ctx.config.PUBLIC_API_URL}/unsubscribe/${r.leadId}>` } : undefined,
       })).providerMessageId;

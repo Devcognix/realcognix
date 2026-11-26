@@ -18,3 +18,7 @@ export { MetaMarketingAds } from './ads/meta-marketing.js';
 export { GoogleAdsPlatform } from './ads/google-ads.js';
 export type * from './storage/types.js';
 export { LocalStorage } from './storage/local.js';
+export { S3Storage, type S3Config } from './storage/s3.js';
+export { FallbackLLM } from './llm/fallback.js';
+export * from './registry/catalog.js';
+export * from './registry/build.js';
